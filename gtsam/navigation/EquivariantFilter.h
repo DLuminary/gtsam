@@ -17,8 +17,6 @@
 #include <gtsam/navigation/ManifoldEKF.h>
 #include <gtsam/nonlinear/Values.h>
 
-#include <stdexcept>
-
 namespace gtsam {
 
 /**
@@ -28,10 +26,16 @@ namespace gtsam {
  * It uses a symmetry principle where the error dynamics are autonomous in a
  * specific frame.
  *
- * This implementation supports two modes:
- * 1. **Automatic**: The filter calculates Jacobian A using the input orbit.
- * 2. **Explicit**: You provide the Jacobian A and the manifold covariance Qc
- *    directly.
+ * Both ActionType::Right and ActionType::Left symmetries are supported. The
+ * two differ only in where the prediction and the measurement correction land
+ * on the manifold; see incrementIsAtOrigin().
+ *
+ * Prediction comes in three forms:
+ * 1. **Automatic**: predict() calculates the Jacobian A from the input orbit.
+ * 2. **Explicit A**: predictWithJacobian() takes a continuous-time A and
+ *    discretizes it.
+ * 3. **Explicit transition**: predictWithTransition() takes an already
+ *    discretized Phi and Qd, for models derived directly in discrete time.
  *
  * The filter propagates its error in **error coordinates**, the tangent space at
  * the reference state xi_ref: the covariance P, the error dynamics matrix A and
@@ -102,6 +106,62 @@ class EquivariantFilter : public ManifoldEKF<M> {
 
   /// Access current reference state used as the EqF chart origin.
   const M& referenceState() const { return xi_ref_; }
+
+  /**
+   * @brief Which side of the group estimate an operation must compose on to
+   * land at the reference state.
+   *
+   * ActionType::Left here means a left group *action*,
+   * phi(X, phi(Y, xi)) = phi(XY, xi). It is unrelated to two other uses of
+   * "left" nearby: a left-*invariant* error, the error form Xhat^-1 X that
+   * GTSAM's right retraction induces and that LieGroupEKF and
+   * GalileanPreintegration use, and the left-*trivialized* tangent group
+   * G |x g, a group construction. Either error form pairs with either action
+   * type.
+   *
+   * Prediction always right-composes, X <- X Exp(Lambda dt). For a right
+   * action that places the motion at the current estimate, so Lambda is the
+   * lift there; for a left action it places it at the reference, so Lambda
+   * must be the lift there instead. incrementIsAtOrigin() selects between the
+   * two.
+   *
+   * A measurement correction is different: it is already expressed in error
+   * coordinates at the reference, so the *composition side itself* has to
+   * change. phi(xi_ref, Exp(dx) X) applies it at the reference for a right
+   * action, and phi_{X Exp(dx)}(xi_ref) does so for a left action.
+   * applyCorrection() selects between those.
+   */
+  static constexpr bool incrementIsAtOrigin() {
+    return Symmetry::type == ActionType::Left;
+  }
+
+  /// Evaluate the lift at the reference state with the input mapped there,
+  /// u_origin = psi_u(X^-1). One group inverse, one orbit application, one
+  /// lift evaluation; the value and the Jacobian come from the same call.
+  template <typename Lift, typename InputOrbit>
+  TangentG liftAtOrigin(const InputOrbit& psi_u,
+                        OptionalJacobian<DimG, DimM> D_lift = {}) const {
+    Lift lift_u_origin(psi_u(g_.inverse()));
+    return lift_u_origin(xi_ref_, D_lift);
+  }
+
+  /// Advance the group estimate by a lifted increment and propagate the
+  /// covariance with an already-discretized transition and process noise.
+  void propagate(const TangentG& increment, const MatrixM& Phi,
+                 const CovarianceM& Qd) {
+    g_ = traits<G>::Compose(g_, traits<G>::Expmap(increment));
+    Base::predict(act_on_ref_(g_), Phi, Qd);
+  }
+
+  /// Apply an innovation correction, which lives in error coordinates at the
+  /// reference state, on the side that keeps it there. See
+  /// incrementIsAtOrigin() for why the side depends on the action type.
+  void applyCorrection(const TangentG& delta_x) {
+    const G step = traits<G>::Expmap(delta_x);
+    g_ = incrementIsAtOrigin() ? traits<G>::Compose(g_, step)
+                               : traits<G>::Compose(step, g_);
+    this->X_ = act_on_ref_(g_);
+  }
 
  public:
   /**
@@ -181,28 +241,38 @@ class EquivariantFilter : public ManifoldEKF<M> {
    * @tparam InputOrbit Functor for the input orbit ψ_u.
    * @param psi_u Input Orbit instance.
    * @return MatrixM The calculated error dynamics matrix A.
-   * @throws std::invalid_argument if the symmetry uses a left action. Automatic
-   * left-action error dynamics are not yet supported; use
-   * predictWithJacobian() with an explicit continuous-time A.
+   *
+   * Precondition on the lift, and it is the whole of what makes this formula
+   * work. Lambda must satisfy the EqF lift condition: its fundamental vector
+   * field must reproduce the dynamics,
+   *
+   *     X_{Lambda(xi,u)}(xi) = f_u(xi)   for every xi, not just xi_ref,
+   *
+   * equivalently Lambda(phi_X(xi), psi_X(u)) = Ad_X Lambda(xi,u). This is not
+   * a new requirement introduced for left actions; it is what the existing
+   * right-action symmetries already satisfy, and it is what lets D_lift carry
+   * the transport term rather than needing one added by hand.
+   *
+   * A lift that is merely *invariant*, Lambda(phi_X(xi), psi_X(u)) =
+   * Lambda(xi,u), is a different and equally valid parameterisation of the
+   * same estimator, but this formula does not apply to it: the correct matrix
+   * is then Dphi0 * D_lift - ad_{Lambda}. The two agree at xi_ref and diverge
+   * away from it, so a check made only at the origin will not catch the
+   * difference. To use the automatic path, supply the equivariant form; for a
+   * body-frame lift lambda on a left-regular factor that means Ad_xi lambda.
+   *
+   * Given that precondition the formula holds for both ActionType::Right and
+   * ActionType::Left, and for DimM != DimG. For the left-regular action of a
+   * group on itself it reproduces the -ad term that
+   * LieGroupEKF::transitionMatrix() derives independently from
+   * Baker-Campbell-Hausdorff, and that the left-invariant EKF of Barrau and
+   * Bonnabel gives for the same system.
    */
   template <typename Lift, typename InputOrbit>
   MatrixM computeErrorDynamicsMatrix(const InputOrbit& psi_u) const {
-    if constexpr (Symmetry::type == ActionType::Left) {
-      throw std::invalid_argument(
-          "EquivariantFilter automatic prediction does not support left "
-          "group actions; call predictWithJacobian() with an explicit "
-          "continuous-time A");
-    } else {
-      MatrixGM D_lift;
-      // Map current input to origin: u_origin = psi_u(X^-1)
-      auto u_origin = psi_u(g_.inverse());
-
-      // Lift at origin: D_lift = d(Lambda(xi_ref, u_origin))/dxi
-      Lift lift_u_origin(u_origin);
-      lift_u_origin(xi_ref_, &D_lift);
-
-      return Dphi0_ * D_lift;
-    }
+    MatrixGM D_lift;
+    liftAtOrigin<Lift>(psi_u, &D_lift);
+    return Dphi0_ * D_lift;
   }
 
   /**
@@ -240,17 +310,23 @@ class EquivariantFilter : public ManifoldEKF<M> {
    * @param psi_u Input Orbit for the current input.
    * @param Qc Process noise covariance on the manifold (continuous-time).
    * @param dt Time step.
-   * @throws std::invalid_argument if the symmetry uses a left action. Use
-   * predictWithJacobian() and provide the continuous-time A explicitly.
    */
   template <size_t K = 1, typename Lift, typename InputOrbit>
   void predict(const Lift& lift_u, const InputOrbit& psi_u, const MatrixM& Qc,
                double dt) {
-    // 1. Compute A automatically
-    MatrixM A = computeErrorDynamicsMatrix<Lift>(psi_u);
+    // 1. One evaluation of the lift at the origin yields both its Jacobian,
+    // from which A follows, and the origin-frame value.
+    MatrixGM D_lift;
+    const TangentG lambda_at_origin = liftAtOrigin<Lift>(psi_u, &D_lift);
+    const MatrixM A = Dphi0_ * D_lift;
 
-    // 2. Delegate to explicit predict with manifold Qc
-    predictWithJacobian<K>(lift_u, A, Qc, dt);
+    // 2. Lifted increment in the frame the prediction composes in. This is
+    // where the two action types differ; A itself does not. For a left action
+    // the value just computed is already the right one.
+    const TangentG Lambda =
+        incrementIsAtOrigin() ? lambda_at_origin : lift_u(this->state());
+
+    propagate(Lambda * dt, transitionMatrix<K>(A, dt), CovarianceM(Qc * dt));
   }
 
   /**
@@ -272,20 +348,42 @@ class EquivariantFilter : public ManifoldEKF<M> {
   template <size_t K = 1, typename Lift>
   void predictWithJacobian(const Lift& lift_u, const MatrixM& A,
                            const MatrixM& Qc, double dt) {
-    // 1. Mean Propagation on Group
-    M xi_est = this->state();          // Pure action
-    TangentG Lambda = lift_u(xi_est);  // Pure lift
+    // Lambda is taken at the current estimate. For a left action with a
+    // state-dependent lift this is the wrong frame; use predict(), which has
+    // the input orbit needed to evaluate the lift at the origin.
+    const TangentG Lambda = lift_u(this->state());
+    propagate(Lambda * dt, transitionMatrix<K>(A, dt), CovarianceM(Qc * dt));
+  }
 
-    g_ = traits<G>::Compose(g_, traits<G>::Expmap(Lambda * dt));
-    M xi_next = act_on_ref_(g_);
-
-    // 2. Covariance Propagation on Manifold
-    MatrixM Phi = transitionMatrix<K>(A, dt);
-
-    // Qc is manifold continuous-time covariance: Q_M = Qc * dt
-    CovarianceM Q_manifold = Qc * dt;
-
-    Base::predict(xi_next, Phi, Q_manifold);
+  /**
+   * @brief Propagate with an already-discretized transition and process noise.
+   *
+   * transitionMatrix() discretizes a continuous-time A by a truncated series.
+   * That converges to exp(A dt), but at the default K = 1 it is only first
+   * order, and reaching machine precision on a block such as the right-Jacobian
+   * term of a Galilean model takes K around 8. More importantly, some
+   * derivations are natively discrete and never define a continuous A at all:
+   * the equivariant IMU preintegration of Delama et al. uses a discrete lift
+   * and gives closed forms for the discrete transition and noise matrices
+   * directly. Callers who know Phi and Qd supply them here instead.
+   *
+   * Takes the input orbit for the same reason predict() does: for a left
+   * action the lifted increment must be evaluated at the origin, which needs
+   * the input mapped there.
+   *
+   * @param lift_u Lift functor for the current input.
+   * @param psi_u Input Orbit instance.
+   * @param Phi Discrete transition matrix over dt (DimM x DimM).
+   * @param Qd Discrete process noise over dt, in error coordinates.
+   * @param dt Time step, used for the mean only.
+   */
+  template <typename Lift, typename InputOrbit>
+  void predictWithTransition(const Lift& lift_u, const InputOrbit& psi_u,
+                             const MatrixM& Phi, const CovarianceM& Qd,
+                             double dt) {
+    const TangentG Lambda = incrementIsAtOrigin() ? liftAtOrigin<Lift>(psi_u)
+                                                  : lift_u(this->state());
+    propagate(Lambda * dt, Phi, Qd);
   }
 
   /**
@@ -324,8 +422,7 @@ class EquivariantFilter : public ManifoldEKF<M> {
 
     // Lift correction to Group tangent space
     TangentG delta_x = InnovationLift_ * delta_xi;
-    g_ = traits<G>::Compose(traits<G>::Expmap(delta_x), g_);
-    this->X_ = act_on_ref_(g_);
+    applyCorrection(delta_x);
 
     // Update covariance on Manifold using Joseph form
     this->JosephUpdate(K, H, R);
@@ -363,8 +460,7 @@ class EquivariantFilter : public ManifoldEKF<M> {
     const TangentM delta_xi = -K * innovation;
     const TangentG delta_x = innovationLift(delta_xi);
 
-    g_ = traits<G>::Compose(traits<G>::Expmap(delta_x), g_);
-    this->X_ = act_on_ref_(g_);
+    applyCorrection(delta_x);
     this->JosephUpdate(K, H, R);
   }
 };

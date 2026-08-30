@@ -545,37 +545,301 @@ struct Lift {
   Vector3 omega_;
 };
 
+// A constant lift is only equivariant if the input action carries the state
+// dependence instead: Lambda(phi_X(xi), psi_X(u)) = psi_X(u) must equal
+// Ad_X Lambda(xi,u) = Ad_X u, so psi_X(u) = Ad_X u. With a trivial input
+// action the lift is not equivariant, and the error is stationary only at
+// X0 = Identity.
 struct InputAction : public GroupAction<InputAction, G, Vector3> {
   static constexpr ActionType type = ActionType::Left;
 
-  Vector3 operator()(const G&, const Vector3& input) const { return input; }
+  Vector3 operator()(const G& group, const Vector3& input) const {
+    return group.rotate(input);  // Ad_X u
+  }
 };
 
 using InputOrbit = InputAction::Orbit;
 
-// Verifies that left actions require an explicit continuous-time A matrix.
-TEST(EquivariantFilter_LeftAction, AutomaticPredictionRequiresExplicitA) {
-  const Matrix3 covariance = I_3x3;
-  EquivariantFilter<M, Symmetry> filter(M::Identity(), covariance);
-
+// A state-independent lift, made equivariant by the adjoint input action,
+// describes spatial dynamics xi_dot = omega^ xi. The error is then exactly
+// stationary and A = 0 -- for any initial group estimate, not just Identity.
+TEST(EquivariantFilter_LeftAction, ConstantLiftGivesZeroDynamics) {
   const Vector3 omega{0.1, -0.2, 0.3};
   const Lift lift(omega);
   const InputOrbit inputOrbit(omega);
-  const Matrix3 processNoise = Z_3x3;
   const double dt = 0.01;
 
-  CHECK_EXCEPTION(filter.predict(lift, inputOrbit, processNoise, dt),
-                  std::invalid_argument);
-  EXPECT(assert_equal(M::Identity(), filter.state()));
+  const G X0 = Rot3::Expmap(Vector3(0.4, 0.1, -0.7));
+  EquivariantFilter<M, Symmetry> filter(M::Identity(), I_3x3, X0);
 
-  const Matrix3 continuousA = -Rot3::Hat(omega);
-  filter.predictWithJacobian<2>(lift, continuousA, processNoise, dt);
-  EXPECT(assert_equal(Rot3::Expmap(omega * dt), filter.state(), 1e-9));
+  const Matrix3 A =
+      filter.computeErrorDynamicsMatrix<Lift, InputOrbit>(inputOrbit);
+  EXPECT(assert_equal(Matrix3(Z_3x3), A, 1e-9));
+
+  // Mean follows the spatial dynamics: xi_hat+ = Exp(omega dt) xi_hat.
+  filter.predict(lift, inputOrbit, Z_3x3, dt);
+  EXPECT(assert_equal(Rot3::Expmap(omega * dt) * X0, filter.state(), 1e-9));
 }
 
 }  // namespace left_action_guard
+
+/* ************************************************************************* */
+// Left-regular action of a noncommutative group on itself, with the genuine
+// equivariant lift Lambda(xi,u) = Ad_xi u. Its differential at the origin is
+// -ad_u, which is exactly the transport the automatic path must reproduce.
+namespace left_regular {
+
+using M = Rot3;
+using G = Rot3;
+
+struct Symmetry : public GroupAction<Symmetry, G, M> {
+  static constexpr ActionType type = ActionType::Left;
+  M operator()(const G& group, const M& state,
+               OptionalJacobian<3, 3> H_group = {},
+               OptionalJacobian<3, 3> H_state = {}) const {
+    return group.compose(state, H_group, H_state);
+  }
+};
+
+/// Equivariant lift Lambda(xi, u) = Ad_xi u, with its true Jacobian.
+///
+/// The Ad is here because the frames do not match, not because the action is a
+/// left one. A left action's fundamental vector field is spatial, while this
+/// system's velocity is a body velocity (xi+ = xi Exp(u h)), so the lift
+/// condition X_Lambda(xi) = f_u(xi) forces Ad_xi u. The mirror case exists for
+/// right actions: their fundamental field is a body velocity, so a spatially
+/// specified system needs Ad_{xi^-1} u there. A constant lift is correct only
+/// when the two frames agree, which is why every right-action fixture above
+/// has one -- IMU inputs are body quantities and those actions are body-framed.
+struct Lift {
+  explicit Lift(const Vector3& u) : u_(u) {}
+  Vector3 operator()(const M& xi, OptionalJacobian<3, 3> H = {}) const {
+    if (H) *H = -Rot3::adjointMap(u_);  // d/dxi Ad_xi u at xi = Identity
+    return xi.rotate(u_);
+  }
+ private:
+  Vector3 u_;
+};
+
+/// Equivariance then forces the input action: Lambda(phi_X(xi), psi_X(u)) =
+/// Ad_X Lambda(xi,u) reduces to psi_X(u) = u here. The lift and the input
+/// action are not independent choices.
+struct InputAction : public GroupAction<InputAction, G, Vector3> {
+  static constexpr ActionType type = ActionType::Left;
+  Vector3 operator()(const G&, const Vector3& input) const { return input; }
+};
+using InputOrbit = InputAction::Orbit;
+
+TEST(EquivariantFilter_LeftRegular, ErrorDynamicsIsMinusAdU) {
+  const Vector3 u{0.3, -0.2, 0.5};
+  // A does not depend on X0 here: the input action is trivial, so u_origin = u,
+  // and D_lift is taken at the origin. A non-identity estimate is used only to
+  // keep the fixture from being accidentally special.
+  const G X0 = Rot3::Expmap(Vector3(0.4, 0.1, -0.7));
+  EquivariantFilter<M, Symmetry> filter(M::Identity(), I_3x3, X0);
+
+  const InputOrbit inputOrbit(u);
+  const Matrix3 A =
+      filter.computeErrorDynamicsMatrix<Lift, InputOrbit>(inputOrbit);
+  // -ad_u: the same term LieGroupEKF::transitionMatrix() obtains as Df - ad_xi
+  // for a left-invariant error with state-independent dynamics (Df = 0).
+  EXPECT(assert_equal(Matrix3(-Rot3::adjointMap(u)), A, 1e-9));
+}
+
+// Compare the automatic transition against the exact nonlinear error flow.
+// True system: xi+ = xi Exp(u h); estimate right-composes; E = Xhat^-1 xi.
+TEST(EquivariantFilter_LeftRegular, MatchesNumericalErrorFlow) {
+  const Vector3 u{0.3, -0.2, 0.5};
+  const G X0 = Rot3::Expmap(Vector3(0.4, 0.1, -0.7));
+  const double h = 1e-3;
+
+  EquivariantFilter<M, Symmetry> filter(M::Identity(), I_3x3, X0);
+  const InputOrbit inputOrbit(u);
+  const Matrix3 A =
+      filter.computeErrorDynamicsMatrix<Lift, InputOrbit>(inputOrbit);
+  const Matrix3 Phi = I_3x3 + A * h;
+
+  const Vector3 eps0{1e-4, -2e-4, 1.5e-4};
+  const Rot3 xi0 = X0.compose(Rot3::Expmap(eps0));
+  const Rot3 xi1 = xi0.compose(Rot3::Expmap(u * h));
+  const Rot3 X1 = X0.compose(Rot3::Expmap(u * h));
+  const Vector3 eps1 = Rot3::Logmap(X1.inverse().compose(xi1));
+
+  EXPECT(assert_equal(Vector3(Phi * eps0), eps1, 1e-9));
+  // A = 0, what a zero-Jacobian lift would give, does not reproduce the flow.
+  EXPECT(!assert_equal(Vector3(eps0), Vector3(eps1), 1e-9));
+}
+
+// The mean must also be right: the prediction right-composes, so the lifted
+// increment has to be the origin-frame Lambda(xi_ref, u_origin).
+TEST(EquivariantFilter_LeftRegular, MeanPropagation) {
+  const Vector3 u{0.3, -0.2, 0.5};
+  const G X0 = Rot3::Expmap(Vector3(0.4, 0.1, -0.7));
+  const double h = 0.01;
+
+  EquivariantFilter<M, Symmetry> filter(M::Identity(), I_3x3, X0);
+  filter.predict(Lift(u), InputOrbit(u), Z_3x3, h);
+  EXPECT(assert_equal(X0.compose(Rot3::Expmap(u * h)), filter.state(), 1e-9));
+}
+
+// predictWithTransition() must use the same frame as predict(); with a
+// state-dependent lift and a left action, taking the lift at the estimate
+// would give a silently wrong mean.
+TEST(EquivariantFilter_LeftRegular, PredictWithTransitionMatchesPredict) {
+  const Vector3 u{0.3, -0.2, 0.5};
+  const G X0 = Rot3::Expmap(Vector3(0.4, 0.1, -0.7));
+  const double h = 0.01;
+
+  EquivariantFilter<M, Symmetry> a(M::Identity(), I_3x3, X0);
+  a.predict(Lift(u), InputOrbit(u), Z_3x3, h);
+
+  EquivariantFilter<M, Symmetry> b(M::Identity(), I_3x3, X0);
+  const Matrix3 A =
+      b.computeErrorDynamicsMatrix<Lift, InputOrbit>(InputOrbit(u));
+  b.predictWithTransition(Lift(u), InputOrbit(u), Matrix3(I_3x3 + A * h),
+                          Matrix3(Z_3x3), h);
+
+  EXPECT(assert_equal(a.state(), b.state(), 1e-12));
+  EXPECT(assert_equal(X0.compose(Rot3::Expmap(u * h)), b.state(), 1e-9));
+}
+
+// A measurement correction lives in error coordinates at the reference state,
+// so it must be composed on the side that keeps it there -- the opposite side
+// from a right action. Composing on the wrong side rotates the correction by
+// Ad_{X^-1}, which is invisible only when X is the identity.
+TEST(EquivariantFilter_LeftRegular, UpdateAppliesCorrectionAtTheOrigin) {
+  const G X0 = Rot3::Expmap(Vector3(0.4, 0.1, -0.7));
+  EquivariantFilter<M, Symmetry> filter(M::Identity(), I_3x3, X0);
+
+  const Vector3 eps{2e-3, -3e-3, 1.5e-3};
+  const Rot3 xi_true = X0.compose(Rot3::Expmap(eps));  // error is eps
+
+  // Measure the error coordinates directly: H = I and a tiny R give K ~ I,
+  // so the correction delta_xi is the measured vector.
+  const Vector3 v{1e-3, -1.5e-3, 0.8e-3};
+  filter.update<Vector3>(Vector3::Zero(), Matrix3(I_3x3), v,
+                         Matrix3(1e-9 * I_3x3));
+
+  const Vector3 epsAfter =
+      Rot3::Logmap(filter.groupEstimate().inverse().compose(xi_true));
+  EXPECT(assert_equal(Vector3(eps - v), epsAfter, 1e-5));
+}
+
+// gtsam#2753's counterexample, in the terms the issue states it: the
+// left-regular action on a noncommutative group, prediction Yhat+ = Yhat
+// Exp(u h), and error flow E+ = Exp(-u h) E Exp(u h). The issue observes
+// A = 0 for a state-independent lift; that lift does not satisfy the lift
+// condition for this system, and the one that does returns exactly the
+// -ad_u the issue expects.
+TEST(EquivariantFilter_LeftRegular, Issue2753Counterexample) {
+  const Vector3 u{0.3, -0.2, 0.5};
+  const G X0 = Rot3::Expmap(Vector3(0.4, 0.1, -0.7));
+  const double h = 1e-3;
+
+  EquivariantFilter<M, Symmetry> filter(M::Identity(), I_3x3, X0);
+  const InputOrbit inputOrbit(u);
+  const Matrix3 A =
+      filter.computeErrorDynamicsMatrix<Lift, InputOrbit>(inputOrbit);
+
+  // the continuous generator the issue states
+  EXPECT(assert_equal(Matrix3(-Rot3::adjointMap(u)), A, 1e-9));
+
+  // the discrete transition the issue states, Ad_Exp(-u h)
+  EXPECT(assert_equal(Matrix3(Rot3::Expmap(-u * h).matrix()),
+                      Matrix3(filter.transitionMatrix<8>(A, h)), 1e-9));
+
+  // the prediction the issue states, Yhat+ = Yhat Exp(u h)
+  filter.predict(Lift(u), inputOrbit, Z_3x3, h);
+  EXPECT(assert_equal(X0.compose(Rot3::Expmap(u * h)), filter.groupEstimate(),
+                      1e-9));
+
+  // the error flow the issue states, E+ = Exp(-u h) E Exp(u h)
+  const Rot3 E0 = Rot3::Expmap(Vector3(1e-4, -2e-4, 1.5e-4));
+  const Rot3 xi1 = X0.compose(E0).compose(Rot3::Expmap(u * h));
+  const Rot3 E1 = filter.groupEstimate().inverse().compose(xi1);
+  EXPECT(assert_equal(
+      Rot3::Expmap(-u * h).compose(E0).compose(Rot3::Expmap(u * h)), E1, 1e-9));
+}
+
+}  // namespace left_regular
 /* ************************************************************************* */
 
+/* ************************************************************************* */
+// Left action with DimM != DimG and a non-constant equivariant lift.
+//   G = SO(3) (dim 3) acting on M = S^2 (dim 2) by phi_Q(eta) = Q eta.
+// Transitive but NOT free: the stabiliser of eta is span{eta}. The minimal
+// equivariant lift Lambda(eta,w) = w - (w.eta) eta removes that freedom and,
+// unlike every other fixture in this file, has a non-zero Jacobian.
+namespace left_sphere {
+
+using M = Unit3;
+using G = Rot3;
+
+struct Symmetry : public GroupAction<Symmetry, G, M> {
+  static constexpr ActionType type = ActionType::Left;
+  M operator()(const G& Q, const M& eta, OptionalJacobian<2, 3> H_Q = {},
+               OptionalJacobian<2, 2> H_eta = {}) const {
+    return Q.rotate(eta, H_Q, H_eta);
+  }
+};
+
+/// Lambda(eta, w) = w - (w . eta) eta, with its Jacobian in local coordinates:
+///   d/d(eta) = -eta (w^T B) - (w . eta) B,  B = eta.basis()
+struct Lift {
+  explicit Lift(const Vector3& w) : w_(w) {}
+  Vector3 operator()(const M& eta, OptionalJacobian<3, 2> H = {}) const {
+    const Vector3 n = eta.unitVector();
+    const double wn = w_.dot(n);
+    if (H) {
+      const Matrix32 B = eta.basis();
+      *H = -n * (w_.transpose() * B) - wn * B;
+    }
+    return w_ - wn * n;
+  }
+ private:
+  Vector3 w_;
+};
+
+/// Left input action psi_Q(w) = Q w makes the lift above equivariant.
+struct InputAction : public GroupAction<InputAction, G, Vector3> {
+  static constexpr ActionType type = ActionType::Left;
+  Vector3 operator()(const G& Q, const Vector3& w) const { return Q.rotate(w); }
+};
+using InputOrbit = InputAction::Orbit;
+
+TEST(EquivariantFilter_LeftSphere, ErrorDynamicsMatchesNumericalGenerator) {
+  const Unit3 eta_ref(0.2, -0.5, 0.84);
+  const G X0 = Rot3::Expmap(Vector3(0.4, 0.1, -0.7));
+  const Vector3 w{0.3, -0.2, 0.5};
+
+  EquivariantFilter<M, Symmetry> filter(eta_ref, I_2x2, X0);
+  const InputOrbit inputOrbit(w);
+  const Matrix2 A =
+      filter.computeErrorDynamicsMatrix<Lift, InputOrbit>(inputOrbit);
+
+  // Exact error velocity in local coordinates:
+  //   E = Q^T eta,  Edot = (u_origin - Lambda(eta_ref, u_origin)) x E
+  const Vector3 u_origin = X0.inverse().rotate(w);
+  const Vector3 lambda = Lift(u_origin)(eta_ref);
+  const Matrix32 B = eta_ref.basis();
+  auto errorVelocity = [&](const Vector2& eps) -> Vector2 {
+    const Vector3 E = eta_ref.retract(eps).unitVector();
+    return B.transpose() * (u_origin - lambda).cross(E);
+  };
+  const Matrix2 A_numerical =
+      numericalDerivative11<Vector2, Vector2>(errorVelocity, Vector2::Zero());
+
+  EXPECT(assert_equal(A_numerical, A, 1e-7));
+  // The origin is an equilibrium of the error.
+  EXPECT(assert_equal(Vector2::Zero().eval(), errorVelocity(Vector2::Zero()),
+                      1e-9));
+  // A constant lift would report zero here, which is wrong by ~0.38.
+  EXPECT(!assert_equal(Matrix2(Z_2x2), Matrix2(A), 1e-3));
+}
+
+}  // namespace left_sphere
+
+/* ************************************************************************* */
 int main() {
   TestResult tr;
   return TestRegistry::runAllTests(tr);
